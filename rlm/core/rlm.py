@@ -74,6 +74,10 @@ class RLM:
         on_subcall_complete: Callable[[int, str, float, str | None], None] | None = None,
         on_iteration_start: Callable[[int, int], None] | None = None,
         on_iteration_complete: Callable[[int, int, float], None] | None = None,
+        agent_definition: dict[str, Any] | None = None,
+        agent_allowed_tools: list[str] | None = None,
+        agent_permission_mode: str = "bypassPermissions",
+        agent_hooks: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -106,6 +110,33 @@ class RLM:
             on_subcall_complete: Callback fired when a child RLM completes. Args: (depth, model, duration, error_or_none).
             on_iteration_start: Callback fired when an iteration starts. Args: (depth, iteration_num).
             on_iteration_complete: Callback fired when an iteration completes. Args: (depth, iteration_num, duration).
+            agent_definition: Dict of named AgentDefinition objects for Claude Agent SDK execution.
+                When provided with backend="vertex_anthropic", RLM bypasses REPL execution and uses
+                Claude Agent SDK with specialized sub-agents. Each key is an agent name, each value
+                is an AgentDefinition specifying tools, prompt, and model.
+                Requires: pip install claude-agent-sdk
+                Example:
+                    from claude_agent_sdk import AgentDefinition
+                    agents = {
+                        "researcher": AgentDefinition(
+                            description="Web research specialist",
+                            tools=["WebSearch", "Write"],
+                            prompt="You are a research agent...",
+                            model="claude-opus-4-1"
+                        )
+                    }
+                    rlm = RLM(
+                        backend="vertex_anthropic",
+                        agent_definition=agents,
+                    )
+            agent_allowed_tools: List of tool names available to the lead agent (not sub-agents).
+                Defaults to ["Task"] when agent_definition is provided.
+                Sub-agents get tools from their individual AgentDefinition.tools.
+            agent_permission_mode: Permission mode for Claude Agent SDK.
+                Options: "bypassPermissions" (default), "requirePermissions".
+            agent_hooks: Hooks for tracking agent SDK tool use.
+                Structure: {"PreToolUse": [HookMatcher(...)], "PostToolUse": [...]}
+                Enables observability for agent execution.
         """
         # Store config for spawning per-completion
         self.backend = backend
@@ -143,6 +174,12 @@ class RLM:
         self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
+
+        # Agent SDK configuration
+        self.agent_definition = agent_definition
+        self.agent_allowed_tools = agent_allowed_tools
+        self.agent_permission_mode = agent_permission_mode
+        self.agent_hooks = agent_hooks
 
         # Event callbacks for live tree display
         self.on_subcall_start = on_subcall_start
@@ -268,25 +305,115 @@ class RLM:
             )
         return message_history
 
+    def _should_use_agent_sdk(self) -> bool:
+        """Determine if Claude Agent SDK execution should be used.
+
+        Agent SDK is used when:
+        1. agent_definition is provided
+        2. backend is vertex_anthropic
+        3. depth is 0 (root RLM only, not sub-calls)
+
+        Returns:
+            True if Agent SDK should be used, False for REPL execution.
+        """
+        return (
+            self.agent_definition is not None
+            and self.backend == "vertex_anthropic"
+            and self.depth == 0
+        )
+
+    def _validate_agent_sdk_config(self) -> None:
+        """Validate Agent SDK configuration and warn about incompatibilities.
+
+        Raises:
+            ImportError: If claude-agent-sdk is not installed but agent_definition is provided.
+        """
+        if self.agent_definition is None:
+            return
+
+        # Validate SDK is installed
+        try:
+            import claude_agent_sdk  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "agent_definition requires 'claude-agent-sdk' package.\n"
+                "Install with: pip install claude-agent-sdk\n"
+                "Or: uv pip install claude-agent-sdk"
+            ) from e
+
+        # Warn if backend doesn't support Agent SDK
+        if self.backend not in ["vertex_anthropic"]:
+            import warnings
+
+            warnings.warn(
+                f"agent_definition provided but backend='{self.backend}' doesn't support Agent SDK. "
+                f"Falling back to REPL execution. Use backend='vertex_anthropic' for Agent SDK support.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        # Warn about incompatible features
+        self._warn_incompatible_features()
+
+    def _warn_incompatible_features(self) -> None:
+        """Warn if features incompatible with Agent SDK are set."""
+        if not self._should_use_agent_sdk():
+            return
+
+        import warnings
+
+        if self.custom_tools is not None:
+            warnings.warn(
+                "custom_tools is ignored when using Agent SDK. "
+                "Define tools in AgentDefinition.tools instead.",
+                UserWarning,
+                stacklevel=4,
+            )
+
+        if self.max_depth > 1:
+            warnings.warn(
+                "max_depth > 1 is ignored when using Agent SDK. "
+                "Sub-agents are defined via agent_definition dict instead.",
+                UserWarning,
+                stacklevel=4,
+            )
+
+        if self.persistent:
+            warnings.warn(
+                "persistent mode is not supported with Agent SDK (stateless execution).",
+                UserWarning,
+                stacklevel=4,
+            )
+
     def completion(
         self, prompt: str | dict[str, Any], root_prompt: str | None = None
     ) -> RLMChatCompletion:
         """
-        Recursive Language Model completion call. This is the main entry point for querying an RLM, and
-        can replace a regular LM completion call.
+        Recursive Language Model completion call.
 
-        Spawns its own environment and LM handler for the duration of this call.
+        Execution path depends on configuration:
+        - Agent SDK: When agent_definition + backend=vertex_anthropic + depth=0
+        - REPL: Standard execution (default)
 
         Args:
             prompt: A single string or dictionary of messages to pass as context to the model.
-            root_prompt: We allow the RLM's root LM to see a (small) prompt that the user specifies. A common example of this
-            is if the user is asking the RLM to answer a question, we can pass the question as the root prompt.
+            root_prompt: Optional small prompt visible to root LM (e.g., user's question).
+
         Returns:
-            A final answer as a string.
+            A final answer as RLMChatCompletion.
         """
         time_start = time.perf_counter()
         self._completion_start_time = time_start
 
+        # Validate agent SDK config if specified
+        if self.agent_definition is not None:
+            self._validate_agent_sdk_config()
+
+        # Route to appropriate execution path
+        if self._should_use_agent_sdk():
+            return self._completion_via_agent_sdk(prompt)
+
+        # REPL execution path (original code below)
         # Reset tracking state for this completion
         self._consecutive_errors = 0
         self._last_error = None
@@ -835,6 +962,109 @@ class RLM:
     def _env_supports_persistence(env: BaseEnv) -> bool:
         """Check if an environment instance supports persistent mode methods."""
         return isinstance(env, SupportsPersistence)
+
+    def _completion_via_agent_sdk(self, prompt: str | dict[str, Any]) -> RLMChatCompletion:
+        """Execute completion using Claude Agent SDK.
+
+        This path bypasses REPL execution and delegates to Claude Agent SDK
+        with specialized sub-agents defined in agent_definition.
+
+        Args:
+            prompt: User prompt (string or message dict).
+
+        Returns:
+            RLMChatCompletion with response from Agent SDK.
+
+        Raises:
+            RuntimeError: If Agent SDK execution fails.
+        """
+        import asyncio
+
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+        from rlm.clients.vertex_patch import patch_anthropic_for_vertex
+
+        time_start = time.perf_counter()
+
+        # Patch Anthropic SDK to use Vertex AI
+        patch_anthropic_for_vertex()
+
+        # Build ClaudeAgentOptions
+        options = ClaudeAgentOptions(
+            permission_mode=self.agent_permission_mode,
+            setting_sources=["project"],
+            system_prompt=self.system_prompt,
+            allowed_tools=self.agent_allowed_tools or ["Task"],
+            agents=self.agent_definition,
+            hooks=self.agent_hooks,
+            model=self.backend_kwargs.get("model_name", "claude-opus-4-1")
+            if self.backend_kwargs
+            else "claude-opus-4-1",
+        )
+
+        # Convert prompt to string if dict/list
+        if isinstance(prompt, dict):
+            prompt_str = prompt.get("content", str(prompt))
+        elif isinstance(prompt, list):
+            prompt_str = "\n".join(
+                msg.get("content", str(msg)) for msg in prompt if isinstance(msg, dict)
+            )
+        else:
+            prompt_str = str(prompt)
+
+        # Execute via Agent SDK
+        response_text = ""
+
+        async def _run_agent():
+            nonlocal response_text
+            try:
+                async with ClaudeSDKClient(options=options) as client:
+                    await client.query(prompt=prompt_str)
+
+                    # Stream and collect response
+                    async for msg in client.receive_response():
+                        if type(msg).__name__ == "AssistantMessage":
+                            # Extract text from message
+                            if hasattr(msg, "text"):
+                                text = msg.text
+                            elif hasattr(msg, "content"):
+                                text = str(msg.content)
+                            else:
+                                text = str(msg)
+
+                            response_text += text
+
+                            if self.verbose:
+                                print(text, end="", flush=True)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Claude Agent SDK query failed: {str(e)}\n\n"
+                    f"Troubleshooting:\n"
+                    f"  - Verify Vertex AI API is enabled\n"
+                    f"  - Check IAM permissions (roles/aiplatform.user)\n"
+                    f"  - Verify model availability in region\n"
+                    f"  - Review agent_definition for tool/prompt errors"
+                ) from e
+
+        # Run async agent in sync context
+        asyncio.run(_run_agent())
+
+        time_end = time.perf_counter()
+
+        # Build RLMChatCompletion
+        # Note: Agent SDK doesn't provide usage tracking, so we use empty summary
+        usage = UsageSummary(model_usage_summaries={})
+
+        return RLMChatCompletion(
+            root_model=self.backend_kwargs.get("model_name", "claude-opus-4-1")
+            if self.backend_kwargs
+            else "claude-opus-4-1",
+            prompt=prompt,
+            response=response_text,
+            usage_summary=usage,
+            execution_time=time_end - time_start,
+            metadata=None,
+        )
 
     def close(self) -> None:
         """Clean up persistent environment. Call when done with multi-turn conversations."""

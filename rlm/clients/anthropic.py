@@ -10,18 +10,36 @@ from rlm.core.types import ModelUsageSummary, UsageSummary
 class AnthropicClient(BaseLM):
     """
     LM Client for running models with the Anthropic API.
+
+    Supports two initialization modes:
+    1. Standard: Pass api_key to create new Anthropic client
+    2. Pre-configured: Pass anthropic_client to use existing client (e.g., AnthropicVertex)
     """
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         model_name: str | None = None,
         max_tokens: int = 32768,
+        anthropic_client: Any | None = None,
         **kwargs,
     ):
         super().__init__(model_name=model_name, **kwargs)
-        self.client = anthropic.Anthropic(api_key=api_key, timeout=self.timeout)
-        self.async_client = anthropic.AsyncAnthropic(api_key=api_key, timeout=self.timeout)
+
+        # Support pre-configured client (e.g., AnthropicVertex for Vertex AI)
+        if anthropic_client is not None:
+            self.client = anthropic_client
+            self.async_client = anthropic_client  # Vertex client handles both sync/async
+        elif api_key is not None:
+            self.client = anthropic.Anthropic(api_key=api_key, timeout=self.timeout)
+            self.async_client = anthropic.AsyncAnthropic(api_key=api_key, timeout=self.timeout)
+        else:
+            raise ValueError(
+                "Either 'api_key' or 'anthropic_client' must be provided.\n"
+                "  - api_key: For direct Anthropic API access\n"
+                "  - anthropic_client: For pre-configured clients (e.g., AnthropicVertex)"
+            )
+
         self.model_name = model_name
         self.max_tokens = max_tokens
 
@@ -38,7 +56,12 @@ class AnthropicClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Anthropic client.")
 
-        kwargs = {"model": model, "max_tokens": self.max_tokens, "messages": messages}
+        kwargs = {
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            "timeout": min(self.timeout, 300.0),  # Cap at 5 minutes to avoid streaming requirement
+        }
         if system:
             kwargs["system"] = system
 
@@ -55,7 +78,12 @@ class AnthropicClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Anthropic client.")
 
-        kwargs = {"model": model, "max_tokens": self.max_tokens, "messages": messages}
+        kwargs = {
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            "timeout": min(self.timeout, 300.0),  # Cap at 5 minutes to avoid streaming requirement
+        }
         if system:
             kwargs["system"] = system
 
