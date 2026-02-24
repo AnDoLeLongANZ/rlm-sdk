@@ -981,6 +981,7 @@ class RLM:
         import asyncio
 
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+        from claude_agent_sdk import TextBlock as AgentTextBlock
 
         from rlm.clients.vertex_patch import patch_anthropic_for_vertex
 
@@ -1024,11 +1025,19 @@ class RLM:
                     # Stream and collect response
                     async for msg in client.receive_response():
                         if type(msg).__name__ == "AssistantMessage":
-                            # Extract text from message
-                            if hasattr(msg, "text"):
+                            # Extract text from message, filtering out ThinkingBlocks
+                            if hasattr(msg, "content"):
+                                content = msg.content
+                                if isinstance(content, list):
+                                    text = "\n\n".join(
+                                        block.text
+                                        for block in content
+                                        if isinstance(block, AgentTextBlock)
+                                    )
+                                else:
+                                    text = str(content)
+                            elif hasattr(msg, "text"):
                                 text = msg.text
-                            elif hasattr(msg, "content"):
-                                text = str(msg.content)
                             else:
                                 text = str(msg)
 

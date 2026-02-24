@@ -36,12 +36,12 @@ class VertexAnthropicClient(BaseLM):
         """
         super().__init__(model_name=model_name or "claude-opus-4-1", timeout=timeout, **kwargs)
 
-        # Phase 1: Load from environment with explicit precedence
+        # Load from environment with explicit precedence
         self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
         self.location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-east5")
         self.model_name = model_name or "claude-opus-4-1"
 
-        # Phase 2: Fail-fast validation (no silent fallbacks)
+        # Fail-fast validation (no silent fallbacks)
         if not self.project_id:
             raise ValueError(
                 "GCP project ID required. Provide via:\n"
@@ -51,7 +51,7 @@ class VertexAnthropicClient(BaseLM):
                 "See: https://cloud.google.com/docs/authentication"
             )
 
-        # Phase 3: Validate credentials file if specified
+        # Validate credentials file if specified
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if creds_path:
             if not Path(creds_path).exists():
@@ -64,7 +64,7 @@ class VertexAnthropicClient(BaseLM):
                     f"  3. Use ADC instead: gcloud auth login --update-adc && unset GOOGLE_APPLICATION_CREDENTIALS"
                 )
 
-        # Phase 4: Create authenticated client
+        # Create authenticated client
         try:
             self.client = AnthropicVertex(project_id=self.project_id, region=self.location)
         except Exception as e:
@@ -163,7 +163,7 @@ class VertexAnthropicClient(BaseLM):
 
         self._track_usage(response, self.model_name)
 
-        return response.content[0].text
+        return "\n\n".join(block.text for block in response.content if block.type == "text")
 
     async def acompletion(self, prompt: str | dict[str, Any]) -> str:
         """Async completion via Vertex AI.

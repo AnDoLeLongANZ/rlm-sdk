@@ -4,18 +4,10 @@ This example demonstrates using RLM with Claude Agent SDK for Vertex AI.
 When agent_definition is provided with backend="vertex_anthropic", RLM
 bypasses REPL execution and uses Agent SDK's multi-agent orchestration.
 
-Prerequisites:
-1. Install dependencies: uv pip install -e ".[vertex_ai,claude_agent]"
-2. Set up GCP authentication: gcloud auth application-default login
-3. Set environment variables in .env:
-   - GOOGLE_CLOUD_PROJECT=your-project-id
-   - GOOGLE_CLOUD_LOCATION=us-east5 (or your preferred region)
-4. Enable Vertex AI API: gcloud services enable aiplatform.googleapis.com
-
 Architecture:
   Load .env
       ↓
-  Define agent_definition sub-agents (researcher, analyst)
+  Define agent_definition sub-agents (coder, analyst)
       ↓
   Create RLM with agent_definition + backend="vertex_anthropic"
       ↓
@@ -29,6 +21,7 @@ Architecture:
 """
 
 import os
+
 from dotenv import load_dotenv
 
 # Step 1: Load environment variables FIRST
@@ -36,8 +29,8 @@ load_dotenv(override=True)
 
 # Step 2: Import RLM and verify auth
 from rlm import RLM
-from rlm.logger import RLMLogger
 from rlm.clients.vertex_auth import verify_vertex_auth
+from rlm.logger import RLMLogger
 
 auth_ok, auth_message = verify_vertex_auth()
 if not auth_ok:
@@ -63,33 +56,33 @@ except ImportError:
 
 # Step 4: Define specialized sub-agents using AgentDefinition
 agents = {
-    "researcher": AgentDefinition(
+    "coder": AgentDefinition(
         description=(
-            "Use this agent for web research tasks. The researcher gathers "
-            "information, articles, and sources from across the internet."
+            "Use this agent for Python computation tasks. The coder writes "
+            "and executes Python code to solve mathematical problems."
         ),
-        tools=["WebSearch", "Write"],
+        tools=["Bash", "Write"],
         prompt=(
-            "You are a research specialist. Your role is to:\n"
-            "1. Search the web for relevant, credible information\n"
-            "2. Synthesize findings into clear summaries\n"
-            "3. Write research notes for later analysis\n"
-            "Be thorough and cite sources."
+            "You are a Python computation specialist. Your role is to:\n"
+            "1. Write clear, correct Python code to solve the given problem\n"
+            "2. Execute the code using Bash and capture the output\n"
+            "3. Write the raw results to a file called results.txt\n"
+            "Show your work step by step."
         ),
         model="sonnet"  # Sub-agent uses Sonnet
     ),
     "analyst": AgentDefinition(
         description=(
-            "Use this agent for data analysis tasks. The analyst processes "
-            "information and generates insights."
+            "Use this agent for result analysis tasks. The analyst reads "
+            "computed output and explains the mathematical significance."
         ),
         tools=["Read", "Write"],
         prompt=(
-            "You are a data analyst. Your role is to:\n"
-            "1. Read research findings\n"
-            "2. Identify key trends and patterns\n"
-            "3. Generate actionable insights\n"
-            "Be concise and data-driven."
+            "You are a mathematical analyst. Your role is to:\n"
+            "1. Read the computation results from results.txt\n"
+            "2. Identify patterns and mathematical properties\n"
+            "3. Explain the significance of the results clearly\n"
+            "Be concise and precise."
         ),
         model="haiku"  # Sub-agent uses Haiku (faster)
     )
@@ -116,15 +109,16 @@ rlm = RLM(
 print("=" * 60)
 print("RLM with Agent SDK Mode")
 print("=" * 60)
-print("\nAsking RLM to delegate to researcher and analyst agents...\n")
+print("\nAsking RLM to delegate to coder and analyst agents...\n")
 
 result = rlm.completion(
-    "Research the top 3 trends in AI for 2026. "
-    "Then analyze the findings and provide a brief summary."
+    "Using Python code, compute the first 20 Fibonacci numbers and their "
+    "ratios to consecutive terms. Show your work. "
+    "Then analyze the results and explain the golden ratio connection."
 )
 
 print("\n" + "=" * 60)
-print("RESULT:")
+print("RESULT")
 print("=" * 60)
 print(f"\nExecution Time: {result.execution_time:.2f}s")
 print(f"Model: {result.root_model}")

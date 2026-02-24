@@ -67,7 +67,7 @@ class AnthropicClient(BaseLM):
 
         response = self.client.messages.create(**kwargs)
         self._track_cost(response, model)
-        return response.content[0].text
+        return "\n\n".join(block.text for block in response.content if block.type == "text")
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -89,7 +89,7 @@ class AnthropicClient(BaseLM):
 
         response = await self.async_client.messages.create(**kwargs)
         self._track_cost(response, model)
-        return response.content[0].text
+        return "\n\n".join(block.text for block in response.content if block.type == "text")
 
     def _prepare_messages(
         self, prompt: str | list[dict[str, Any]]
