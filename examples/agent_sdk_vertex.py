@@ -24,10 +24,9 @@ import os
 
 from dotenv import load_dotenv
 
-# Step 1: Load environment variables FIRST
 load_dotenv(override=True)
 
-# Step 2: Import RLM and verify auth
+# Import RLM and verify auth
 from rlm import RLM
 from rlm.clients.vertex_auth import verify_vertex_auth
 from rlm.logger import RLMLogger
@@ -45,7 +44,6 @@ if not auth_ok:
 
 print(f"Authentication: {auth_message}\n")
 
-# Step 3: Import Claude Agent SDK for AgentDefinition
 try:
     from claude_agent_sdk import AgentDefinition
 except ImportError:
@@ -54,7 +52,7 @@ except ImportError:
     print("Or: pip install claude-agent-sdk\n")
     exit(1)
 
-# Step 4: Define specialized sub-agents using AgentDefinition
+# Define specialized sub-agents using AgentDefinition
 agents = {
     "coder": AgentDefinition(
         description=(
@@ -88,7 +86,7 @@ agents = {
     )
 }
 
-# Step 5: Create RLM with Agent SDK configuration
+# Create RLM with Agent SDK configuration
 logger = RLMLogger(log_dir="./logs")
 
 rlm = RLM(
@@ -105,7 +103,7 @@ rlm = RLM(
     verbose=True,
 )
 
-# Step 6: Use RLM - it will use Agent SDK execution (not REPL)
+# Use RLM - it will use Agent SDK execution (not REPL)
 print("=" * 60)
 print("RLM with Agent SDK Mode")
 print("=" * 60)
