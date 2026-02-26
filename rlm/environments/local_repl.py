@@ -200,7 +200,7 @@ class LocalREPL(NonIsolatedEnv):
         for name, entry in self.custom_tools.items():
             value = extract_tool_value(entry)
             if callable(value):
-                self.globals[name] = value
+                self.globals[name] = self._wrap_custom_tool(value)
             else:
                 # For non-callable values (constants, data), add to locals
                 self.locals[name] = value
@@ -230,6 +230,27 @@ class LocalREPL(NonIsolatedEnv):
             f"No variables have been created yet. "
             f"You must create and assign a variable in a REPL block BEFORE calling FINAL_VAR on it."
         )
+
+    def _wrap_custom_tool(self, fn: Callable) -> Callable:
+        """Wrap a custom tool callable so that RLMChatCompletion return values are captured.
+
+        When a custom tool returns an RLMChatCompletion, the completion is appended to
+        _pending_llm_calls (making it visible in the parent code block's rlm_calls metadata)
+        and the plain response string is returned to the REPL code instead.
+
+        Tools that return any other type pass through unchanged.
+        """
+
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            if isinstance(result, RLMChatCompletion):
+                self._pending_llm_calls.append(result)
+                return result.response
+            return result
+
+        wrapper.__name__ = getattr(fn, "__name__", "custom_tool")
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
+        return wrapper
 
     def _show_vars(self) -> str:
         """Show all available variables in the REPL environment."""

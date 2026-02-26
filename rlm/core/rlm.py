@@ -306,12 +306,10 @@ class RLM:
         return message_history
 
     def _should_use_agent_sdk(self) -> bool:
-        """Determine if Claude Agent SDK execution should be used.
+        """Return True when Agent SDK should be used instead of REPL.
 
-        Agent SDK is used when:
-        1. agent_definition is provided
-        2. backend is vertex_anthropic
-        3. depth is 0 (root RLM only, not sub-calls)
+        Conditions: agent_definition is set, backend is "vertex_anthropic", and depth == 0.
+        Sub-RLMs (depth > 0) always fall back to REPL even if agent_definition exists.
 
         Returns:
             True if Agent SDK should be used, False for REPL execution.
@@ -363,12 +361,17 @@ class RLM:
         import warnings
 
         if self.custom_tools is not None:
-            warnings.warn(
-                "custom_tools is ignored when using Agent SDK. "
-                "Define tools in AgentDefinition.tools instead.",
-                UserWarning,
-                stacklevel=4,
-            )
+            non_repl_tools = [k for k in self.custom_tools if k != "execute_in_repl"]
+            if non_repl_tools:
+                warnings.warn(
+                    f"custom_tools keys {non_repl_tools} are ignored when using Agent SDK. "
+                    "Define tools in AgentDefinition.tools instead. "
+                    "Note: 'execute_in_repl' is auto-promoted to an MCP server tool.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+            elif "execute_in_repl" in self.custom_tools:
+                pass  # execute_in_repl is handled via MCP server; no warning needed
 
         if self.max_depth > 1:
             warnings.warn(
@@ -388,12 +391,7 @@ class RLM:
     def completion(
         self, prompt: str | dict[str, Any], root_prompt: str | None = None
     ) -> RLMChatCompletion:
-        """
-        Recursive Language Model completion call.
-
-        Execution path depends on configuration:
-        - Agent SDK: When agent_definition + backend=vertex_anthropic + depth=0
-        - REPL: Standard execution (default)
+        """Run a completion, routing to Agent SDK or REPL based on configuration.
 
         Args:
             prompt: A single string or dictionary of messages to pass as context to the model.
@@ -770,21 +768,13 @@ class RLM:
         return response
 
     def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
-        """
-        Handle a subcall from the environment, potentially spawning a child RLM.
-
-        This method is passed as a callback to LocalREPL to enable recursive RLM calls.
-        When depth allows, it spawns a child RLM with its own REPL. At max depth,
-        it falls back to a plain LM completion.
+        """Handle a subcall, spawning a child RLM or falling back to plain LM at max depth.
 
         Args:
             prompt: The prompt to process.
-            model: Optional model name. If specified, the child RLM will use this model
-                instead of inheriting the parent's default backend.
-
+            model: Optional model override for the child RLM.
         Returns:
-            The full RLMChatCompletion from either a child RLM or plain LM completion.
-            On error, returns a completion with the error message as the response.
+            RLMChatCompletion from the child RLM or plain LM; error as response on failure.
         """
         next_depth = self.depth + 1
 
@@ -934,18 +924,10 @@ class RLM:
                     pass  # Don't let callback errors break execution
 
     def _validate_persistent_environment_support(self) -> None:
-        """
-        Validate that the configured environment type supports persistent mode.
+        """Raise ValueError if the environment type does not support persistent mode.
 
-        Persistent mode requires environments to implement:
-        - update_handler_address(address): Update LM handler address between calls
-        - add_context(payload, index): Add new context for multi-turn conversations
-        - get_context_count(): Return the number of loaded contexts
-
-        Currently only 'local' (LocalREPL) supports these methods.
-
-        Raises:
-            ValueError: If the environment type does not support persistent mode.
+        Currently only 'local' (LocalREPL) supports update_handler_address, add_context,
+        and get_context_count.
         """
         # Known environments that support persistence
         persistent_supported_environments = {"local"}
@@ -964,24 +946,20 @@ class RLM:
         return isinstance(env, SupportsPersistence)
 
     def _completion_via_agent_sdk(self, prompt: str | dict[str, Any]) -> RLMChatCompletion:
-        """Execute completion using Claude Agent SDK.
-
-        This path bypasses REPL execution and delegates to Claude Agent SDK
-        with specialized sub-agents defined in agent_definition.
+        """Bypass REPL and delegate to Agent SDK sub-agents (depth=0 only).
 
         Args:
             prompt: User prompt (string or message dict).
-
         Returns:
             RLMChatCompletion with response from Agent SDK.
-
         Raises:
             RuntimeError: If Agent SDK execution fails.
         """
         import asyncio
 
-        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
         from claude_agent_sdk import TextBlock as AgentTextBlock
+        from claude_agent_sdk.types import HookContext, HookInput, HookJSONOutput
 
         from rlm.clients.vertex_patch import patch_anthropic_for_vertex
 
@@ -990,14 +968,113 @@ class RLM:
         # Patch Anthropic SDK to use Vertex AI
         patch_anthropic_for_vertex()
 
+        # Accumulate tool call records: each entry is a dict with
+        # tool_name, tool_input, tool_output, tool_use_id, and status.
+        captured_tool_calls: list[dict[str, Any]] = []
+
+        async def _pre_tool_hook(
+            hook_input: HookInput,
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> HookJSONOutput:
+            captured_tool_calls.append(
+                {
+                    "tool_name": hook_input.get("tool_name", ""),
+                    "tool_input": hook_input.get("tool_input", {}),
+                    "tool_output": None,
+                    "tool_use_id": tool_use_id,
+                    "status": "pending",
+                }
+            )
+            return {"continue_": True}
+
+        async def _post_tool_hook(
+            hook_input: HookInput,
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> HookJSONOutput:
+            tool_use_id_val = tool_use_id
+            tool_name = hook_input.get("tool_name", "")
+            tool_response = hook_input.get("tool_response")
+
+            # For execute_in_repl (called directly or via MCP server), extract nested
+            # RLM metadata from the structured dict returned by
+            # create_instrumented_repl_executor().
+            _repl_tool_names = {"execute_in_repl", "mcp__repl-executor__execute_in_repl"}
+            nested_rlm_calls: list[Any] = []
+            nested_metadata: dict[str, Any] | None = None
+            if tool_name in _repl_tool_names and isinstance(tool_response, dict):
+                nested_metadata = tool_response.get("metadata")
+                nested_rlm_calls = tool_response.get("rlm_calls") or []
+
+            # Update the matching pending entry with its output
+            for entry in reversed(captured_tool_calls):
+                if entry.get("tool_use_id") == tool_use_id_val and entry["status"] == "pending":
+                    entry["tool_output"] = tool_response
+                    entry["status"] = "completed"
+                    if tool_name in _repl_tool_names:
+                        entry["rlm_calls"] = nested_rlm_calls
+                        entry["rlm_metadata"] = nested_metadata
+                    break
+            else:
+                # No matching pre-hook entry: record as standalone completed call
+                new_entry: dict[str, Any] = {
+                    "tool_name": tool_name,
+                    "tool_input": hook_input.get("tool_input", {}),
+                    "tool_output": tool_response,
+                    "tool_use_id": tool_use_id_val,
+                    "status": "completed",
+                }
+                if tool_name in _repl_tool_names:
+                    new_entry["rlm_calls"] = nested_rlm_calls
+                    new_entry["rlm_metadata"] = nested_metadata
+                captured_tool_calls.append(new_entry)
+            return {"continue_": True}
+
+        # Build internal hook matchers that capture every tool call
+        internal_hooks: dict[str, list[HookMatcher]] = {
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[_pre_tool_hook])],
+            "PostToolUse": [HookMatcher(matcher=None, hooks=[_post_tool_hook])],
+        }
+
+        # Merge with any user-provided hooks (user hooks appended after internal ones)
+        merged_hooks: dict[str, list[HookMatcher]] = dict(internal_hooks)
+        if self.agent_hooks:
+            for event, matchers in self.agent_hooks.items():
+                if event in merged_hooks:
+                    merged_hooks[event] = merged_hooks[event] + list(matchers)
+                else:
+                    merged_hooks[event] = list(matchers)
+
+        # Auto-promote execute_in_repl from custom_tools to an in-process MCP server so the
+        # Agent SDK orchestrator can call it as a real tool (custom_tools is not visible to the
+        # Agent SDK subprocess; MCP servers are the correct extension point).
+        mcp_servers: dict[str, Any] = {}
+        allowed_tools = list(self.agent_allowed_tools or ["Task"])
+        if self.custom_tools and "execute_in_repl" in self.custom_tools:
+            from rlm.utils.repl_executor import create_repl_mcp_server
+
+            repl_mcp = create_repl_mcp_server(self.custom_tools["execute_in_repl"])
+            mcp_servers["repl-executor"] = {
+                "type": "sdk",
+                "name": "repl-executor",
+                "instance": repl_mcp._mcp_server,
+            }
+            # Allow the orchestrator to call execute_in_repl via the MCP server.
+            # Claude Code MCP tool names are prefixed: mcp__<server>__<tool>.
+            mcp_tool_name = "mcp__repl-executor__execute_in_repl"
+            if mcp_tool_name not in allowed_tools:
+                allowed_tools.append(mcp_tool_name)
+
         # Build ClaudeAgentOptions
         options = ClaudeAgentOptions(
             permission_mode=self.agent_permission_mode,
             setting_sources=["project"],
             system_prompt=self.system_prompt,
-            allowed_tools=self.agent_allowed_tools or ["Task"],
+            allowed_tools=allowed_tools,
             agents=self.agent_definition,
-            hooks=self.agent_hooks,
+            hooks=merged_hooks,  # type: ignore[arg-type]
+            mcp_servers=mcp_servers,  # type: ignore[arg-type]
             model=self.backend_kwargs.get("model_name", "claude-opus-4-1")
             if self.backend_kwargs
             else "claude-opus-4-1",
@@ -1058,7 +1135,59 @@ class RLM:
         # Run async agent in sync context
         asyncio.run(_run_agent())
 
+        # Store captured tool calls for downstream use (e.g., US-002 code_block conversion)
+        self._last_agent_tool_calls = captured_tool_calls
+
         time_end = time.perf_counter()
+
+        # Build CodeBlock entries for execute_in_repl tool calls so nested RLM
+        # iterations appear under code_block.result.rlm_calls in the trajectory.
+        _repl_tool_names_outer = {"execute_in_repl", "mcp__repl-executor__execute_in_repl"}
+        agent_sdk_code_blocks: list[CodeBlock] = []
+        for tc in captured_tool_calls:
+            if tc.get("tool_name") in _repl_tool_names_outer and tc.get("status") == "completed":
+                task_input = tc.get("tool_input") or {}
+                task_text = (
+                    task_input.get("task", str(task_input))
+                    if isinstance(task_input, dict)
+                    else str(task_input)
+                )
+                tool_output = tc.get("tool_output") or {}
+                response_str = (
+                    tool_output.get("response", "")
+                    if isinstance(tool_output, dict)
+                    else str(tool_output)
+                )
+                # Reconstruct sub-RLM calls as RLMChatCompletion objects for REPLResult
+                raw_rlm_calls = tc.get("rlm_calls") or []
+                sub_calls: list[RLMChatCompletion] = []
+                for raw_call in raw_rlm_calls:
+                    if isinstance(raw_call, dict):
+                        try:
+                            sub_calls.append(RLMChatCompletion.from_dict(raw_call))
+                        except Exception:
+                            pass
+
+                repl_result = REPLResult(
+                    stdout=response_str,
+                    stderr="",
+                    locals={},
+                    execution_time=0.0,
+                    rlm_calls=sub_calls,
+                    final_answer=response_str,
+                )
+                agent_sdk_code_blocks.append(CodeBlock(code=task_text, result=repl_result))
+
+        # Log iteration to logger if available, matching the guard at rlm.py:601
+        if self.logger:
+            iteration = RLMIteration(
+                prompt=[{"role": "user", "content": prompt_str}],
+                response=response_text,
+                code_blocks=agent_sdk_code_blocks,
+                final_answer=response_text,
+                iteration_time=time_end - time_start,
+            )
+            self.logger.log(iteration)
 
         # Build RLMChatCompletion
         # Note: Agent SDK doesn't provide usage tracking, so we use empty summary
@@ -1072,7 +1201,7 @@ class RLM:
             response=response_text,
             usage_summary=usage,
             execution_time=time_end - time_start,
-            metadata=None,
+            metadata=self.logger.get_trajectory() if self.logger else None,
         )
 
     def close(self) -> None:
